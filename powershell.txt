@@ -1,0 +1,61 @@
+& {
+    $ErrorActionPreference = 'Stop'
+
+    $url = 'https://raw.githubusercontent.com/johnsmithtools/base64-tools-backup/a23e816150157258f0935f57f26a43537fe9cee2/PLMXML_ALL_MODULES_NOCOMMENTS_BASE64.txt'
+    $expectedHash = '8fa7c334b44df8500d504a9bf415296b7c80a18447cf43dcb9961756ea47ee51'
+
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $folder = Join-Path $desktop ('Base64ToolsBackup-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    $modulesFolder = Join-Path $folder 'bas-files'
+    New-Item -ItemType Directory -Path $modulesFolder -ErrorAction Stop | Out-Null
+    $encodedFile = Join-Path $folder 'PLMXML_ALL_MODULES_NOCOMMENTS_BASE64.txt'
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $encodedFile
+    if ((Get-FileHash -LiteralPath $encodedFile -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw 'The download does not match the original backup. No modules were extracted.'
+    }
+
+    $encoded = [IO.File]::ReadAllText($encodedFile)
+    $decodedBytes = [Convert]::FromBase64String($encoded)
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $decoded = $utf8.GetString($decodedBytes)
+
+    $pattern = @'
+(?ms)^[ \t]*'?#MODULE[ \t]+(?<Name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*\r?\n(?<Code>.*?)^[ \t]*'?#END[ \t]+\k<Name>[ \t]*(?:\r?\n|$)
+'@
+    $moduleMatches = [regex]::Matches($decoded, $pattern)
+    $leftover = [regex]::Replace($decoded, $pattern, '')
+    if ($moduleMatches.Count -ne 70 -or -not [string]::IsNullOrWhiteSpace($leftover)) {
+        throw 'Expected 70 complete modules. No modules were extracted.'
+    }
+
+    $names = @{}
+    foreach ($module in $moduleMatches) {
+        $name = $module.Groups['Name'].Value
+        $code = $module.Groups['Code'].Value
+        $vbHeader = [regex]::Match($code, '(?m)^Attribute VB_Name = "([^"]+)"\r?$')
+        if ($names.ContainsKey($name) -or ($vbHeader.Success -and $vbHeader.Groups[1].Value -cne $name)) {
+            throw "Duplicate or mismatched module name: $name"
+        }
+        $names[$name] = $true
+    }
+    if ($decoded -match '[^\x00-\x7F]') {
+        throw 'Unexpected non-ASCII text. No modules were extracted.'
+    }
+
+    [IO.File]::WriteAllBytes((Join-Path $folder 'DECODED_BUNDLE.txt'), $decodedBytes)
+    foreach ($module in $moduleMatches) {
+        $name = $module.Groups['Name'].Value
+        $code = $module.Groups['Code'].Value
+        if (-not [regex]::IsMatch($code, '(?m)^Attribute VB_Name = ')) {
+            $code = 'Attribute VB_Name = "' + $name + '"' + "`r`n" + $code
+        }
+        $code = $code -replace '\r?\n', "`r`n"
+        [IO.File]::WriteAllText((Join-Path $modulesFolder ($name + '.bas')), $code, [Text.Encoding]::ASCII)
+    }
+
+    Write-Host "Done: extracted $($moduleMatches.Count) .bas files." -ForegroundColor Green
+    Write-Host "Decoded text and modules are in: $folder"
+    Invoke-Item -LiteralPath $folder
+}
